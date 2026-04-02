@@ -1,0 +1,400 @@
+diff --git a/caddyfile.go b/caddyfile.go
+index b673f17..930c7f9 100644
+--- a/caddyfile.go
++++ b/caddyfile.go
+@@ -68,6 +68,19 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+ 			}
+ 			h.Hosts = caddyhttp.MatchHost(args)
+ 
++		case "stats_name":
++			args := d.RemainingArgs()
++			if len(args) != 1 {
++				return d.ArgErr()
++			}
++			if strings.TrimSpace(args[0]) == "" {
++				return d.Err("stats_name cannot be empty")
++			}
++			if h.StatsName != "" {
++				return d.Err("stats_name subdirective specified twice")
++			}
++			h.StatsName = args[0]
++
+ 		case "ports":
+ 			args := d.RemainingArgs()
+ 			if len(args) == 0 {
+diff --git a/forwardproxy.go b/forwardproxy.go
+index f92fe25..f8e0707 100644
+--- a/forwardproxy.go
++++ b/forwardproxy.go
+@@ -42,6 +42,7 @@ import (
+ 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+ 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+ 	"github.com/caddyserver/forwardproxy/httpclient"
++	"github.com/prometheus/client_golang/prometheus"
+ 	"go.uber.org/zap"
+ 	"golang.org/x/net/proxy"
+ )
+@@ -50,12 +51,22 @@ func init() {
+ 	caddy.RegisterModule(Handler{})
+ }
+ 
++var (
++	managedMetricsOnce = sync.Once{}
++	managedUserUpBytes *prometheus.CounterVec
++	managedUserDownBytes *prometheus.CounterVec
++	managedAuthFailures *prometheus.CounterVec
++	managedActiveConnections *prometheus.GaugeVec
++)
++
+ // Handler implements a forward proxy.
+ //
+ // EXPERIMENTAL: This handler is still experimental and subject to breaking changes.
+ type Handler struct {
+ 	logger *zap.Logger
+ 
++	StatsName string `json:"stats_name,omitempty"`
++
+ 	// Filename of the PAC file to serve.
+ 	PACPath string `json:"pac_path,omitempty"`
+ 
+@@ -120,6 +131,9 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
+ // Provision ensures that h is set up properly before use.
+ func (h *Handler) Provision(ctx caddy.Context) error {
+ 	h.logger = ctx.Logger(h)
++	if strings.TrimSpace(h.StatsName) != "" {
++		registerManagedMetrics(ctx.GetMetricsRegistry())
++	}
+ 
+ 	if h.DialTimeout <= 0 {
+ 		h.DialTimeout = caddy.Duration(30 * time.Second)
+@@ -254,6 +268,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+ 	var authErr error
+ 	if h.AuthCredentials != nil {
+ 		authErr = h.checkCredentials(r)
++		if authErr != nil {
++			h.observeAuthFailure()
++		}
+ 	}
+ 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
+ 		return serveHiddenPage(w, authErr)
+@@ -276,6 +293,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+ 		return caddyhttp.Error(http.StatusProxyAuthRequired, authErr)
+ 	}
+ 
++	stats := h.newStatsTracker(r)
++	if stats != nil {
++		defer stats.Done()
++	}
++
+ 	if r.ProtoMajor != 1 && r.ProtoMajor != 2 && r.ProtoMajor != 3 {
+ 		return caddyhttp.Error(http.StatusHTTPVersionNotSupported,
+ 			fmt.Errorf("unsupported HTTP major version: %d", r.ProtoMajor))
+@@ -344,12 +366,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+ 
+ 		switch r.ProtoMajor {
+ 		case 1: // http1: hijack the whole flow
+-			return serveHijack(w, targetConn)
++			return serveHijack(w, targetConn, stats)
+ 		case 2: // http2: keep reading from "request" and writing into same response
+ 			fallthrough
+ 		case 3:
+ 			defer r.Body.Close()
+-			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
++			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "", stats)
+ 		}
+ 
+ 		panic("There was a check for http version, yet it's incorrect")
+@@ -381,6 +403,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+ 	}
+ 
+ 	var response *http.Response
++	var requestBytes int64
++	var requestCounter *countingReadCloser
+ 	if h.upstream == nil {
+ 		// non-upstream request uses httpTransport to reuse connections
+ 		if r.Body != nil &&
+@@ -397,6 +421,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+ 				return io.NopCloser(bytes.NewReader(rBodyBuf)), nil
+ 			}
+ 			r.Body, _ = r.GetBody()
++			requestBytes = int64(len(rBodyBuf))
++		} else if r.Body != nil {
++			requestCounter = &countingReadCloser{ReadCloser: r.Body}
++			r.Body = requestCounter
+ 		}
+ 		response, err = h.httpTransport.RoundTrip(r)
+ 	} else {
+@@ -411,6 +439,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+ 		if r.URL.Port() == "" {
+ 			r.URL.Host = net.JoinHostPort(r.URL.Host, "80")
+ 		}
++		if r.Body != nil {
++			requestCounter = &countingReadCloser{ReadCloser: r.Body}
++			r.Body = requestCounter
++		}
+ 		upsConn, err := h.dialContext(ctx, "tcp", r.URL.Host)
+ 		if err != nil {
+ 			return caddyhttp.Error(http.StatusBadGateway,
+@@ -443,7 +475,149 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+ 			fmt.Errorf("failed to read response: %v", err))
+ 	}
+ 
+-	return forwardResponse(w, response)
++	if requestCounter != nil {
++		requestBytes = requestCounter.Count()
++	}
++	responseBytes, err := forwardResponse(w, response)
++	if stats != nil {
++		stats.AddUp(requestBytes)
++		stats.AddDown(responseBytes)
++	}
++	return err
++}
++
++func registerManagedMetrics(registry *prometheus.Registry) {
++	managedMetricsOnce.Do(func() {
++		managedUserUpBytes = prometheus.NewCounterVec(
++			prometheus.CounterOpts{
++				Name: "sx_ui_naive_user_up_bytes_total",
++				Help: "Total authenticated upstream bytes per naive proxy user.",
++			},
++			[]string{"proxy", "user"},
++		)
++		managedUserDownBytes = prometheus.NewCounterVec(
++			prometheus.CounterOpts{
++				Name: "sx_ui_naive_user_down_bytes_total",
++				Help: "Total authenticated downstream bytes per naive proxy user.",
++			},
++			[]string{"proxy", "user"},
++		)
++		managedAuthFailures = prometheus.NewCounterVec(
++			prometheus.CounterOpts{
++				Name: "sx_ui_naive_auth_failures_total",
++				Help: "Total failed proxy authentication attempts per naive proxy site.",
++			},
++			[]string{"proxy"},
++		)
++		managedActiveConnections = prometheus.NewGaugeVec(
++			prometheus.GaugeOpts{
++				Name: "sx_ui_naive_active_connections",
++				Help: "Current in-flight authenticated proxy connections per naive proxy user.",
++			},
++			[]string{"proxy", "user"},
++		)
++	})
++	if registry == nil {
++		return
++	}
++	for _, collector := range []prometheus.Collector{
++		managedUserUpBytes,
++		managedUserDownBytes,
++		managedAuthFailures,
++		managedActiveConnections,
++	} {
++		if err := registry.Register(collector); err != nil {
++			var already prometheus.AlreadyRegisteredError
++			if !errors.As(err, &already) {
++				panic(err)
++			}
++		}
++	}
++}
++
++func (h Handler) observeAuthFailure() {
++	proxyName := strings.TrimSpace(h.StatsName)
++	if proxyName == "" || managedAuthFailures == nil {
++		return
++	}
++	managedAuthFailures.WithLabelValues(proxyName).Inc()
++}
++
++func (h Handler) newStatsTracker(r *http.Request) *statsTracker {
++	proxyName := strings.TrimSpace(h.StatsName)
++	userID := strings.TrimSpace(readAuthUserID(r))
++	if proxyName == "" || userID == "" || managedActiveConnections == nil {
++		return nil
++	}
++	tracker := &statsTracker{
++		proxy: proxyName,
++		user:  userID,
++	}
++	managedActiveConnections.WithLabelValues(tracker.proxy, tracker.user).Inc()
++	return tracker
++}
++
++func readAuthUserID(r *http.Request) string {
++	if r == nil {
++		return ""
++	}
++	repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
++	if !ok || repl == nil {
++		return ""
++	}
++	value, ok := repl.GetString("http.auth.user.id")
++	if !ok {
++		return ""
++	}
++	userID := strings.TrimSpace(value)
++	if strings.HasPrefix(userID, "invalid") {
++		return ""
++	}
++	return userID
++}
++
++type statsTracker struct {
++	proxy string
++	user  string
++}
++
++func (t *statsTracker) AddUp(bytes int64) {
++	if t == nil || bytes <= 0 || managedUserUpBytes == nil {
++		return
++	}
++	managedUserUpBytes.WithLabelValues(t.proxy, t.user).Add(float64(bytes))
++}
++
++func (t *statsTracker) AddDown(bytes int64) {
++	if t == nil || bytes <= 0 || managedUserDownBytes == nil {
++		return
++	}
++	managedUserDownBytes.WithLabelValues(t.proxy, t.user).Add(float64(bytes))
++}
++
++func (t *statsTracker) Done() {
++	if t == nil || managedActiveConnections == nil {
++		return
++	}
++	managedActiveConnections.WithLabelValues(t.proxy, t.user).Dec()
++}
++
++type countingReadCloser struct {
++	io.ReadCloser
++	count int64
++}
++
++func (c *countingReadCloser) Read(p []byte) (int, error) {
++	n, err := c.ReadCloser.Read(p)
++	c.count += int64(n)
++	return n, err
++}
++
++func (c *countingReadCloser) Count() int64 {
++	if c == nil {
++		return 0
++	}
++	return c.count
+ }
+ 
+ func (h Handler) checkCredentials(r *http.Request) error {
+@@ -628,7 +802,7 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
+ 
+ // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
+ // and hijacked connection.
+-func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
++func serveHijack(w http.ResponseWriter, targetConn net.Conn, stats *statsTracker) error {
+ 	w.WriteHeader(http.StatusOK)
+ 	clientConn, brw, err := http.NewResponseController(w).Hijack()
+ 	if err != nil {
+@@ -648,7 +822,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
+ 			fmt.Errorf("failed to flush to client: %v", err))
+ 	}
+ 
+-	return dualStream(targetConn, clientConn, clientConn, false)
++	return dualStream(targetConn, clientConn, clientConn, false, stats)
+ }
+ 
+ const (
+@@ -661,14 +835,21 @@ const (
+ // Copies data target->clientReader and clientWriter->target, and flushes as needed
+ // Returns when clientWriter-> target stream is done.
+ // Caddy should finish writing target -> clientReader.
+-func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
+-	stream := func(w io.Writer, r io.Reader, paddingType int) error {
++func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool, stats *statsTracker) error {
++	stream := func(w io.Writer, r io.Reader, paddingType int, isDown bool) error {
+ 		// copy bytes from r to w
+ 		bufPtr := bufferPool.Get().(*[]byte)
+ 		buf := *bufPtr
+ 		buf = buf[0:cap(buf)]
+-		_, _err := flushingIoCopy(w, r, buf, paddingType)
++		_, payload, _err := flushingIoCopy(w, r, buf, paddingType)
+ 		bufferPool.Put(bufPtr)
++		if stats != nil {
++			if isDown {
++				stats.AddDown(payload)
++			} else {
++				stats.AddUp(payload)
++			}
++		}
+ 
+ 		if cw, ok := w.(closeWriter); ok {
+ 			_ = cw.CloseWrite()
+@@ -676,11 +857,11 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
+ 		return _err
+ 	}
+ 	if padding {
+-		go stream(target, clientReader, RemovePadding)
+-		return stream(clientWriter, target, AddPadding)
++		go stream(target, clientReader, RemovePadding, false)
++		return stream(clientWriter, target, AddPadding, true)
+ 	}
+-	go stream(target, clientReader, NoPadding) //nolint: errcheck
+-	return stream(clientWriter, target, NoPadding)
++	go stream(target, clientReader, NoPadding, false) //nolint: errcheck
++	return stream(clientWriter, target, NoPadding, true)
+ }
+ 
+ type closeWriter interface {
+@@ -690,7 +871,7 @@ type closeWriter interface {
+ // flushingIoCopy is analogous to buffering io.Copy(), but also attempts to flush on each iteration.
+ // If dst does not implement http.Flusher(e.g. net.TCPConn), it will do a simple io.CopyBuffer().
+ // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
+-func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (written int64, err error) {
++func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (written int64, payload int64, err error) {
+ 	rw, ok := dst.(http.ResponseWriter)
+ 	var rc *http.ResponseController
+ 	if ok {
+@@ -706,6 +887,7 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
+ 			maxRead := 65536 - 3 - paddingSize
+ 			nr, er = src.Read(buf[3:maxRead])
+ 			if nr > 0 {
++				payload += int64(nr)
+ 				buf[0] = byte(nr / 256)
+ 				buf[1] = byte(nr % 256)
+ 				buf[2] = byte(paddingSize)
+@@ -722,12 +904,14 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
+ 				paddingSize := int(buf[2])
+ 				nr, er = io.ReadFull(src, buf[0:nr])
+ 				if nr > 0 {
++					payload += int64(nr)
+ 					var junk [256]byte
+ 					_, er = io.ReadFull(src, junk[0:paddingSize])
+ 				}
+ 			}
+ 		} else {
+ 			nr, er = src.Read(buf)
++			payload += int64(nr)
+ 		}
+ 		if nr > 0 {
+ 			nw, ew := dst.Write(buf[0:nr])
+@@ -761,7 +945,7 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
+ }
+ 
+ // Removes hop-by-hop headers, and writes response into ResponseWriter.
+-func forwardResponse(w http.ResponseWriter, response *http.Response) error {
++func forwardResponse(w http.ResponseWriter, response *http.Response) (int64, error) {
+ 	w.Header().Del("Server") // remove Server: Caddy, append via instead
+ 	w.Header().Add("Via", strconv.Itoa(response.ProtoMajor)+"."+strconv.Itoa(response.ProtoMinor)+" caddy")
+ 
+@@ -775,9 +959,9 @@ func forwardResponse(w http.ResponseWriter, response *http.Response) error {
+ 	bufPtr := bufferPool.Get().(*[]byte)
+ 	buf := *bufPtr
+ 	buf = buf[0:cap(buf)]
+-	_, err := io.CopyBuffer(w, response.Body, buf)
++	written, err := io.CopyBuffer(w, response.Body, buf)
+ 	bufferPool.Put(bufPtr)
+-	return err
++	return written, err
+ }
+ 
+ func removeHopByHop(header http.Header) {

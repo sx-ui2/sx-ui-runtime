@@ -1,0 +1,149 @@
+name: Build sing-box stats runtime
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Official sing-box version or tag to build, leave blank for latest
+        required: false
+        type: string
+      force:
+        description: Rebuild even if this repository already has the matching release
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sing-box-stats-sync
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve upstream version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      should_build: ${{ steps.existing.outputs.should_build }}
+    steps:
+      - id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            RAW_TAG="${INPUT_VERSION}"
+          else
+            RAW_TAG="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')"
+          fi
+
+          VERSION="${RAW_TAG#v}"
+          TAG="v${VERSION}"
+          RELEASE_TAG="sing-box-stats-${TAG}"
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+      - id: existing
+        env:
+          FORCE: ${{ inputs.force }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${FORCE}" == "true" ]]; then
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          STATUS="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+
+          if [[ "${STATUS}" == "200" ]]; then
+            echo "release ${RELEASE_TAG} already exists, skipping build"
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+  build:
+    name: build ${{ matrix.arch }}
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25.8
+      - name: Build runtime
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build-sing-box-stats.sh
+          PACKAGE_DIR="dist/sing-box-${VERSION}-linux-${ARCH}-stats"
+          mkdir -p "${PACKAGE_DIR}"
+          ./scripts/build-sing-box-stats.sh "${VERSION}" "${ARCH}" "${PACKAGE_DIR}"
+      - name: Package runtime
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          tar -C dist -czf "sing-box-${VERSION}-linux-${ARCH}-stats.tar.gz" "sing-box-${VERSION}-linux-${ARCH}-stats"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ needs.resolve.outputs.version }}-${{ matrix.arch }}-stats
+          path: sing-box-${{ needs.resolve.outputs.version }}-linux-${{ matrix.arch }}-stats.tar.gz
+
+  release:
+    name: publish release
+    needs:
+      - resolve
+      - build
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          name: sing-box stats ${{ needs.resolve.outputs.tag }}
+          draft: false
+          prerelease: false
+          body: |
+            Auto-built from official sing-box tag `${{ needs.resolve.outputs.tag }}`.
+
+            Build basis:
+            - official Linux purego default build tags
+            - extra tags: `with_purego`, `with_v2ray_api`
+
+            Included assets:
+            - `sing-box`
+            - `libcronet.so`
+            - `build-info.json`
+          files: |
+            dist/**/*.tar.gz
