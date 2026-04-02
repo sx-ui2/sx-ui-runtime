@@ -15,6 +15,7 @@ Environment:
   XCADDY_VERSION          default: latest
   FORWARDPROXY_REPO       default: https://github.com/klzgrad/forwardproxy.git
   FORWARDPROXY_REF        default: naive
+  FORWARDPROXY_COMMIT     optional pinned commit after clone
   FORWARDPROXY_PATCH      default: scripts/patches/forwardproxy-naive-stats.patch
 EOF
 }
@@ -40,6 +41,7 @@ esac
 XCADDY_VERSION="${XCADDY_VERSION:-latest}"
 FORWARDPROXY_REPO="${FORWARDPROXY_REPO:-https://github.com/klzgrad/forwardproxy.git}"
 FORWARDPROXY_REF="${FORWARDPROXY_REF:-naive}"
+FORWARDPROXY_COMMIT="${FORWARDPROXY_COMMIT:-}"
 FORWARDPROXY_PATCH="${FORWARDPROXY_PATCH:-scripts/patches/forwardproxy-naive-stats.patch}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -52,6 +54,7 @@ if [[ "${FORWARDPROXY_PATCH}" != /* ]]; then
 fi
 
 mkdir -p "${OUTPUT_DIR}"
+OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 
 go install "github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}"
 
@@ -66,6 +69,10 @@ trap 'rm -rf "${WORK_DIR}"' EXIT
 FORWARDPROXY_DIR="${WORK_DIR}/forwardproxy"
 
 git clone --depth=1 --branch "${FORWARDPROXY_REF}" "${FORWARDPROXY_REPO}" "${FORWARDPROXY_DIR}"
+if [[ -n "${FORWARDPROXY_COMMIT}" ]]; then
+  git -C "${FORWARDPROXY_DIR}" fetch --depth=1 origin "${FORWARDPROXY_COMMIT}"
+  git -C "${FORWARDPROXY_DIR}" checkout "${FORWARDPROXY_COMMIT}"
+fi
 if [[ -n "${FORWARDPROXY_PATCH}" ]]; then
   if [[ ! -f "${FORWARDPROXY_PATCH}" ]]; then
     echo "forwardproxy patch not found: ${FORWARDPROXY_PATCH}" >&2
@@ -88,6 +95,7 @@ cat > "${OUTPUT_DIR}/build-info.json" <<EOF
   "goarch": "${ARCH}",
   "forwardproxy_repo": "${FORWARDPROXY_REPO}",
   "forwardproxy_ref": "${FORWARDPROXY_REF}",
+  "forwardproxy_commit": "${FORWARDPROXY_COMMIT}",
   "forwardproxy_patch": "${FORWARDPROXY_PATCH}",
   "plugin": "github.com/caddyserver/forwardproxy (patched naive branch)",
   "note": "Built from official Caddy source with the naive forward_proxy module plus sx-ui stats patch."
