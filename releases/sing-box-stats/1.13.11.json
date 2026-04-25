@@ -1,0 +1,8 @@
+{
+  "runtime": "sing-box-stats",
+  "version": "1.13.11",
+  "upstream_tag": "v1.13.11",
+  "release_tag": "sing-box-stats-v1.13.11",
+  "source": "history-republish",
+  "generated_at": "2026-04-25T04:45:04Z"
+}
