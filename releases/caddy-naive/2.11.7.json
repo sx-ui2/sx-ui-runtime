@@ -1,0 +1,10 @@
+{
+  "runtime": "caddy-naive",
+  "version": "2.11.7",
+  "upstream_tag": "v2.11.7",
+  "release_tag": "caddy-naive-v2.11.7",
+  "run_id": "37121536361",
+  "run_number": "713",
+  "run_attempt": "1",
+  "generated_at": "2026-10-03T12:03:31Z"
+}
